@@ -61,19 +61,24 @@ stages:
         run: terraform apply -input=false -auto-approve
         working-directory: infra
       - id: tf_outputs
-        name: Get Terraform outputs
+        name: Get instance IP
         run: |
           echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
-          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> "$GITHUB_OUTPUT"
         working-directory: infra
     outputs:
       instance_ip: ${{ steps.tf_outputs.outputs.instance_ip }}
-      rds_endpoint: ${{ steps.tf_outputs.outputs.rds_endpoint }}
 
   - id: configure
     kind: configure
     needs: [provision]
     timeout_minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
     steps:
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -81,6 +86,18 @@ stages:
           python-version: "3.11"
       - name: Install Ansible
         run: pip install ansible-core
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+      - name: Read Terraform outputs
+        id: tf_outputs
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+          echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+          echo "rds_endpoint=$(terraform output -raw rds_endpoint)" >> "$GITHUB_OUTPUT"
+        working-directory: infra
       - name: Write SSH key
         env:
           SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -89,30 +106,48 @@ stages:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
       - name: Scan host key
-        run: ssh-keyscan -H "${{ needs.provision.outputs.instance_ip }}" >> ~/.ssh/known_hosts
+        run: ssh-keyscan -H "${{ steps.tf_outputs.outputs.instance_ip }}" >> ~/.ssh/known_hosts
       - name: Generate inventory
         run: |
           cat > inventory.ini << EOF
           [web]
-          ${{ needs.provision.outputs.instance_ip }} ansible_user=${{ secrets.SSH_USER }} ansible_ssh_private_key_file=~/.ssh/deploy_key
+          ${{ steps.tf_outputs.outputs.instance_ip }} ansible_user=${{ secrets.SSH_USER }} ansible_ssh_private_key_file=~/.ssh/deploy_key
           EOF
       - name: Run Ansible playbook
         run: ansible-playbook -i inventory.ini ansible/site.yml
         env:
           ANSIBLE_HOST_KEY_CHECKING: "False"
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          RDS_ENDPOINT: ${{ needs.provision.outputs.rds_endpoint }}
+          RDS_ENDPOINT: ${{ steps.tf_outputs.outputs.rds_endpoint }}
           PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
 
   - id: verify
     kind: verify
     needs: [provision, configure]
     timeout_minutes: 10
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+      TF_VAR_ssh_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
     steps:
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+      - name: Read instance IP from Terraform
+        id: tf_outputs
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=us-east-1"
+          echo "instance_ip=$(terraform output -raw instance_ip)" >> "$GITHUB_OUTPUT"
+        working-directory: infra
       - name: Health check
         run: |
           curl --fail --retry 10 --retry-delay 15 --retry-all-errors \
-            http://${{ needs.provision.outputs.instance_ip }}/health/
+            http://${{ steps.tf_outputs.outputs.instance_ip }}/health/
 
 rollback:
   strategy: manual
