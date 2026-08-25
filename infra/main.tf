@@ -77,7 +77,7 @@ resource "aws_security_group" "app" {
 
 resource "aws_security_group" "db" {
   name        = "${var.project_name}-db-sg"
-  description = "Todo app RDS security group — app only"
+  description = "Todo app RDS security group - app only"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
