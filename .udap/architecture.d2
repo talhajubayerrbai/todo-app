@@ -1,0 +1,12 @@
+# udap:meta cloud=aws region=us-east-1 target=ec2
+
+user: User { shape: person; udap-type: generic.user }
+vpc: VPC (us-east-1) {
+  alb: Nginx (EC2) { shape: rectangle; udap-type: aws.ec2 }
+  app: Django App (EC2) { shape: rectangle; udap-type: aws.ec2 }
+  rds: PostgreSQL (RDS) { shape: cylinder; udap-type: aws.rds }
+}
+
+user -> vpc.alb: HTTPS / HTTP (port 80)
+vpc.alb -> vpc.app: proxy (127.0.0.1:8000)
+vpc.app -> vpc.rds: SQL (port 5432)

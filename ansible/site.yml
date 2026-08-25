@@ -1,0 +1,213 @@
+---
+- name: Configure Todo App server
+  hosts: web
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/todo-app
+    venv_dir: /opt/todo-app/venv
+    app_user: ubuntu
+    app_port: 8000
+    db_name: todo_db
+    db_user: todo_user
+
+  tasks:
+    # ── Wait for SSH ────────────────────────────────────────────────────────
+    - name: Wait for port 22 to be reachable
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        timeout: 120
+      delegate_to: localhost
+      become: false
+
+    # ── System packages ─────────────────────────────────────────────────────
+    - name: Wait for apt lock to release
+      shell: while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do sleep 5; done
+      changed_when: false
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install system dependencies
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - python3-dev
+          - libpq-dev
+          - nginx
+          - git
+        state: present
+
+    # ── App directory ────────────────────────────────────────────────────────
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    # ── Deploy application code ──────────────────────────────────────────────
+    - name: Synchronise application files
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_dir }}/"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: preserve
+        force: true
+
+    # ── Python virtual environment ───────────────────────────────────────────
+    - name: Create Python virtual environment
+      command: python3 -m venv "{{ venv_dir }}"
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
+
+    - name: Install Python dependencies
+      pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+        state: present
+
+    # ── Environment file ─────────────────────────────────────────────────────
+    - name: Write .env file
+      copy:
+        dest: "{{ app_dir }}/.env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0600"
+        content: |
+          SECRET_KEY={{ lookup('env', 'SECRET_KEY') | default('change-me-in-prod-' + lookup('env', 'PROJECT_NAME'), true) }}
+          DEBUG=False
+          ALLOWED_HOSTS=*
+          DATABASE_URL=postgresql://{{ db_user }}:{{ lookup('env', 'DB_PASSWORD') }}@{{ lookup('env', 'RDS_ENDPOINT') }}:5432/{{ db_name }}
+      no_log: true
+
+    # ── Django setup ─────────────────────────────────────────────────────────
+    - name: Run Django migrations
+      command: "{{ venv_dir }}/bin/python manage.py migrate --noinput"
+      args:
+        chdir: "{{ app_dir }}"
+      environment:
+        SECRET_KEY: "{{ lookup('env', 'SECRET_KEY') | default('migrate-secret', true) }}"
+        DATABASE_URL: "postgresql://{{ db_user }}:{{ lookup('env', 'DB_PASSWORD') }}@{{ lookup('env', 'RDS_ENDPOINT') }}:5432/{{ db_name }}"
+        DJANGO_SETTINGS_MODULE: todo_app.settings
+      no_log: true
+
+    - name: Collect static files
+      command: "{{ venv_dir }}/bin/python manage.py collectstatic --noinput"
+      args:
+        chdir: "{{ app_dir }}"
+      environment:
+        SECRET_KEY: "migrate-secret"
+        DATABASE_URL: "sqlite:///tmp/collectstatic.db"
+        DJANGO_SETTINGS_MODULE: todo_app.settings
+
+    # ── Gunicorn systemd service ─────────────────────────────────────────────
+    - name: Install gunicorn systemd unit
+      copy:
+        dest: /etc/systemd/system/todo-app.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Todo App (gunicorn)
+          After=network.target
+
+          [Service]
+          User={{ app_user }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ venv_dir }}/bin/gunicorn todo_app.wsgi:application \
+              --bind 127.0.0.1:{{ app_port }} \
+              --workers 2 \
+              --timeout 60 \
+              --access-logfile - \
+              --error-logfile -
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart todo-app
+
+    - name: Enable and start todo-app service
+      systemd:
+        name: todo-app
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # ── Nginx ────────────────────────────────────────────────────────────────
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+
+    - name: Write nginx virtual host
+      copy:
+        dest: /etc/nginx/sites-available/todo-app
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              server_name _;
+
+              client_max_body_size 10M;
+              gzip on;
+              gzip_types text/plain text/css application/json application/javascript text/xml;
+
+              location /static/ {
+                  alias {{ app_dir }}/staticfiles/;
+                  expires 7d;
+              }
+
+              location / {
+                  proxy_pass         http://127.0.0.1:{{ app_port }};
+                  proxy_set_header   Host $host;
+                  proxy_set_header   X-Real-IP $remote_addr;
+                  proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 60s;
+              }
+          }
+      notify: Reload nginx
+
+    - name: Enable todo-app nginx site
+      file:
+        src: /etc/nginx/sites-available/todo-app
+        dest: /etc/nginx/sites-enabled/todo-app
+        state: link
+      notify: Reload nginx
+
+    - name: Test nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Flush handlers
+      meta: flush_handlers
+
+    # ── Verify app is up ─────────────────────────────────────────────────────
+    - name: Wait for app to be responsive on port 8000
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        timeout: 60
+
+  handlers:
+    - name: Restart todo-app
+      systemd:
+        name: todo-app
+        state: restarted
+        daemon_reload: true
+
+    - name: Reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
